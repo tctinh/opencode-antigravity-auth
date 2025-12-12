@@ -5,25 +5,57 @@ import {
 } from "../constants";
 import { logAntigravityDebugResponse, type AntigravityDebugContext } from "./debug";
 import {
+  // Types
+  type AntigravityApiBody,
+  type ToolDebugInfo,
+  // API response helpers
   extractUsageFromSsePayload,
   extractUsageMetadata,
-  normalizeThinkingConfig,
   parseAntigravityApiBody,
   rewriteAntigravityPreviewAccessError,
-  type AntigravityApiBody,
+  // Model detection
+  parseModelFromUrl,
+  hasAssistantHistory,
+  // Thinking config
+  extractThinkingSource,
+  resolveThinkingConfig,
+  applyThinkingConfig,
+  // Cached content
+  extractCachedContent,
+  cleanupCachedContentFields,
+  // Tool normalization
+  normalizeToolsForClaude,
+  normalizeToolsForGemini,
+  // Claude transformations
+  filterUnsignedThinkingBlocks,
+  assignFunctionCallIds,
 } from "./request-helpers";
 
+// ============================================================================
+// Constants
+// ============================================================================
+
+const SYNTHETIC_PROJECT_ADJECTIVES = ["useful", "bright", "swift", "calm", "bold"];
+const SYNTHETIC_PROJECT_NOUNS = ["fuze", "wave", "spark", "flow", "core"];
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
 function generateSyntheticProjectId(): string {
-  const adjectives = ["useful", "bright", "swift", "calm", "bold"];
-  const nouns = ["fuze", "wave", "spark", "flow", "core"];
-  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-  const noun = nouns[Math.floor(Math.random() * nouns.length)];
+  const adj = SYNTHETIC_PROJECT_ADJECTIVES[Math.floor(Math.random() * SYNTHETIC_PROJECT_ADJECTIVES.length)];
+  const noun = SYNTHETIC_PROJECT_NOUNS[Math.floor(Math.random() * SYNTHETIC_PROJECT_NOUNS.length)];
   const randomPart = crypto.randomUUID().slice(0, 5).toLowerCase();
   return `${adj}-${noun}-${randomPart}`;
 }
 
-const STREAM_ACTION = "streamGenerateContent";
-const DEFAULT_THINKING_BUDGET = 16000;
+function generateRequestId(): string {
+  return `agent-${crypto.randomUUID()}`;
+}
+
+function generateSessionId(): string {
+  return `-${Math.floor(Math.random() * 1e15)}`;
+}
 
 /**
  * Detects requests headed to the Google Generative Language API so we can intercept them.
@@ -31,6 +63,10 @@ const DEFAULT_THINKING_BUDGET = 16000;
 export function isGenerativeLanguageRequest(input: RequestInfo): input is string {
   return typeof input === "string" && input.includes("generativelanguage.googleapis.com");
 }
+
+// ============================================================================
+// Response Transformation
+// ============================================================================
 
 /**
  * Transforms thinking/reasoning content in response parts to OpenCode's expected format.
@@ -115,6 +151,137 @@ function transformStreamingPayload(payload: string): string {
     .join("\n");
 }
 
+// ============================================================================
+// Request Preparation Types
+// ============================================================================
+
+export interface PrepareRequestResult {
+  request: RequestInfo;
+  init: RequestInit;
+  streaming: boolean;
+  requestedModel?: string;
+  effectiveModel?: string;
+  projectId?: string;
+  endpoint?: string;
+  toolDebugMissing?: number;
+  toolDebugSummary?: string;
+  toolDebugPayload?: string;
+}
+
+// ============================================================================
+// Request Body Transformation
+// ============================================================================
+
+/**
+ * Transforms the request payload for Antigravity API.
+ */
+function transformRequestPayload(
+  parsedBody: Record<string, unknown>,
+  modelInfo: { rawModel: string; isClaude: boolean; isThinkingModel: boolean },
+  toolDebugInfo: ToolDebugInfo
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { ...parsedBody };
+
+  // 1. Handle thinking config
+  const sourceThinking = extractThinkingSource(payload);
+  const hasHistory = hasAssistantHistory(payload.contents);
+  const thinkingConfig = resolveThinkingConfig(
+    sourceThinking,
+    modelInfo.isThinkingModel,
+    modelInfo.isClaude,
+    hasHistory
+  );
+  applyThinkingConfig(payload, thinkingConfig);
+
+  // 2. Normalize system instruction field name
+  if ("system_instruction" in payload) {
+    payload.systemInstruction = payload.system_instruction;
+    delete payload.system_instruction;
+  }
+
+  // 3. Handle cached content
+  const cachedContent = extractCachedContent(payload);
+  if (cachedContent) {
+    payload.cachedContent = cachedContent;
+  }
+  cleanupCachedContentFields(payload);
+
+  // 4. Normalize tools
+  if (Array.isArray(payload.tools)) {
+    payload.tools = modelInfo.isClaude
+      ? normalizeToolsForClaude(payload.tools, toolDebugInfo)
+      : normalizeToolsForGemini(payload.tools, toolDebugInfo);
+
+    try {
+      toolDebugInfo.payload = JSON.stringify(payload.tools);
+    } catch {
+      // Ignore serialization errors
+    }
+  }
+
+  // 5. Claude-specific content transformations
+  if (modelInfo.isClaude && Array.isArray(payload.contents)) {
+    payload.contents = filterUnsignedThinkingBlocks(payload.contents as any[]);
+    payload.contents = assignFunctionCallIds(payload.contents as any[]);
+  }
+
+  // 6. Remove model field (will be set at wrapper level)
+  delete payload.model;
+
+  return payload;
+}
+
+/**
+ * Wraps the request payload in Antigravity envelope.
+ */
+function wrapForAntigravity(
+  requestPayload: Record<string, unknown>,
+  model: string,
+  projectId: string
+): Record<string, unknown> {
+  const effectiveProjectId = projectId.trim() || generateSyntheticProjectId();
+
+  return {
+    project: effectiveProjectId,
+    model,
+    request: {
+      ...requestPayload,
+      sessionId: generateSessionId(),
+    },
+    userAgent: "antigravity",
+    requestId: generateRequestId(),
+  };
+}
+
+/**
+ * Sets up headers for Antigravity requests.
+ */
+function setupHeaders(
+  baseHeaders: Headers,
+  accessToken: string,
+  streaming: boolean,
+  toolDebugMissing: number
+): void {
+  baseHeaders.set("Authorization", `Bearer ${accessToken}`);
+  baseHeaders.delete("x-api-key");
+
+  if (streaming) {
+    baseHeaders.set("Accept", "text/event-stream");
+  }
+
+  baseHeaders.set("User-Agent", ANTIGRAVITY_HEADERS["User-Agent"]);
+  baseHeaders.set("X-Goog-Api-Client", ANTIGRAVITY_HEADERS["X-Goog-Api-Client"]);
+  baseHeaders.set("Client-Metadata", ANTIGRAVITY_HEADERS["Client-Metadata"]);
+
+  if (toolDebugMissing > 0) {
+    baseHeaders.set("X-Opencode-Tools-Debug", String(toolDebugMissing));
+  }
+}
+
+// ============================================================================
+// Main Request Preparation Function
+// ============================================================================
+
 /**
  * Rewrites OpenAI-style requests into Antigravity shape, normalizing model, headers,
  * optional cached_content, and thinking config. Also toggles streaming mode for SSE actions.
@@ -125,14 +292,11 @@ export function prepareAntigravityRequest(
   accessToken: string,
   projectId: string,
   endpointOverride?: string,
-): { request: RequestInfo; init: RequestInit; streaming: boolean; requestedModel?: string; effectiveModel?: string; projectId?: string; endpoint?: string; toolDebugMissing?: number; toolDebugSummary?: string; toolDebugPayload?: string } {
+): PrepareRequestResult {
   const baseInit: RequestInit = { ...init };
   const headers = new Headers(init?.headers ?? {});
-  let resolvedProjectId = projectId?.trim() || "";
-  let toolDebugMissing = 0;
-  const toolDebugSummaries: string[] = [];
-  let toolDebugPayload: string | undefined;
 
+  // Early return for non-generative language requests
   if (!isGenerativeLanguageRequest(input)) {
     return {
       request: input,
@@ -141,11 +305,11 @@ export function prepareAntigravityRequest(
     };
   }
 
-  headers.set("Authorization", `Bearer ${accessToken}`);
-  headers.delete("x-api-key");
-
-  const match = input.match(/\/models\/([^:]+):(\w+)/);
-  if (!match) {
+  // Parse model info from URL
+  const modelInfo = parseModelFromUrl(input);
+  if (!modelInfo) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+    headers.delete("x-api-key");
     return {
       request: input,
       init: { ...baseInit, headers },
@@ -153,409 +317,57 @@ export function prepareAntigravityRequest(
     };
   }
 
-  const [, rawModel = "", rawAction = ""] = match;
-  const effectiveModel = rawModel;
-  const upstreamModel = rawModel;
-  const streaming = rawAction === STREAM_ACTION;
+  const { rawModel, action, isStreaming, isClaude, isThinkingModel } = modelInfo;
   const baseEndpoint = endpointOverride ?? ANTIGRAVITY_ENDPOINT;
-  const transformedUrl = `${baseEndpoint}/v1internal:${rawAction}${streaming ? "?alt=sse" : ""
-    }`;
-  const isClaudeModel = upstreamModel.toLowerCase().includes("claude");
+  const transformedUrl = `${baseEndpoint}/v1internal:${action}${isStreaming ? "?alt=sse" : ""}`;
 
+  // Initialize debug info
+  const toolDebugInfo: ToolDebugInfo = { missing: 0, summaries: [] };
+  let resolvedProjectId = projectId?.trim() || "";
   let body = baseInit.body;
+
+  // Transform request body if present
   if (typeof baseInit.body === "string" && baseInit.body) {
-    try {
-      const parsedBody = JSON.parse(baseInit.body) as Record<string, unknown>;
-      const isWrapped = typeof parsedBody.project === "string" && "request" in parsedBody;
+    const parsedBody = JSON.parse(baseInit.body) as Record<string, unknown>;
+    const isAlreadyWrapped = typeof parsedBody.project === "string" && "request" in parsedBody;
 
-      if (isWrapped) {
-        const wrappedBody = {
-          ...parsedBody,
-          model: effectiveModel,
-        } as Record<string, unknown>;
-        body = JSON.stringify(wrappedBody);
-      } else {
-        const requestPayload: Record<string, unknown> = { ...parsedBody };
+    if (isAlreadyWrapped) {
+      // Already wrapped - just update model
+      body = JSON.stringify({ ...parsedBody, model: rawModel });
+    } else {
+      // Transform and wrap the payload
+      const transformedPayload = transformRequestPayload(
+        parsedBody,
+        { rawModel, isClaude, isThinkingModel },
+        toolDebugInfo
+      );
 
-        // Extract thinkingConfig from multiple possible locations
-        const rawGenerationConfig = requestPayload.generationConfig as Record<string, unknown> | undefined;
-        const extraBody = requestPayload.extra_body as Record<string, unknown> | undefined;
-
-        let sourceThinkingConfig = rawGenerationConfig?.thinkingConfig
-          ?? extraBody?.thinkingConfig
-          ?? requestPayload.thinkingConfig;
-
-        // Convert Anthropic-style "thinking" option
-        const anthropicThinking = extraBody?.thinking ?? requestPayload.thinking;
-        if (!sourceThinkingConfig && anthropicThinking && typeof anthropicThinking === "object") {
-          const thinking = anthropicThinking as Record<string, unknown>;
-          if (thinking.type === "enabled" || thinking.budgetTokens) {
-            sourceThinkingConfig = {
-              includeThoughts: true,
-              thinkingBudget: thinking.budgetTokens ?? DEFAULT_THINKING_BUDGET,
-            };
-          }
-        }
-
-        // Auto-enable thinking for thinking-capable models
-        const isThinkingModel = upstreamModel.toLowerCase().includes("thinking")
-          || upstreamModel.toLowerCase().includes("gemini-3")
-          || upstreamModel.toLowerCase().includes("opus");
-
-        const hasAssistantHistory = Array.isArray(requestPayload.contents) &&
-          requestPayload.contents.some((c: any) => c?.role === "model" || c?.role === "assistant");
-
-        // Disable thinking for Claude multi-turn to avoid signature issues
-        if (isThinkingModel && !(isClaudeModel && hasAssistantHistory)) {
-          const existingBudget = (sourceThinkingConfig as any)?.thinkingBudget;
-          sourceThinkingConfig = {
-            includeThoughts: true,
-            thinkingBudget: (existingBudget && existingBudget > 0) ? existingBudget : DEFAULT_THINKING_BUDGET,
-          };
-        } else if (isClaudeModel && hasAssistantHistory) {
-          sourceThinkingConfig = { includeThoughts: false, thinkingBudget: 0 };
-        }
-
-        const normalizedThinking = normalizeThinkingConfig(sourceThinkingConfig);
-        if (normalizedThinking) {
-          if (rawGenerationConfig) {
-            rawGenerationConfig.thinkingConfig = normalizedThinking;
-            requestPayload.generationConfig = rawGenerationConfig;
-          } else {
-            requestPayload.generationConfig = { thinkingConfig: normalizedThinking };
-          }
-        } else if (rawGenerationConfig?.thinkingConfig) {
-          delete rawGenerationConfig.thinkingConfig;
-          requestPayload.generationConfig = rawGenerationConfig;
-        }
-
-        // Clean up thinking fields from extra_body
-        if (extraBody) {
-          delete extraBody.thinkingConfig;
-          delete extraBody.thinking;
-        }
-        delete requestPayload.thinkingConfig;
-        delete requestPayload.thinking;
-
-        if ("system_instruction" in requestPayload) {
-          requestPayload.systemInstruction = requestPayload.system_instruction;
-          delete requestPayload.system_instruction;
-        }
-
-        const cachedContentFromExtra =
-          typeof requestPayload.extra_body === "object" && requestPayload.extra_body
-            ? (requestPayload.extra_body as Record<string, unknown>).cached_content ??
-            (requestPayload.extra_body as Record<string, unknown>).cachedContent
-            : undefined;
-        const cachedContent =
-          (requestPayload.cached_content as string | undefined) ??
-          (requestPayload.cachedContent as string | undefined) ??
-          (cachedContentFromExtra as string | undefined);
-        if (cachedContent) {
-          requestPayload.cachedContent = cachedContent;
-        }
-
-        delete requestPayload.cached_content;
-        delete requestPayload.cachedContent;
-        if (requestPayload.extra_body && typeof requestPayload.extra_body === "object") {
-          delete (requestPayload.extra_body as Record<string, unknown>).cached_content;
-          delete (requestPayload.extra_body as Record<string, unknown>).cachedContent;
-          if (Object.keys(requestPayload.extra_body as Record<string, unknown>).length === 0) {
-            delete requestPayload.extra_body;
-          }
-        }
-
-        // Normalize tools. For Claude models, keep full function declarations (names + schemas).
-        if (Array.isArray(requestPayload.tools)) {
-          if (isClaudeModel) {
-            const functionDeclarations: any[] = [];
-            const passthroughTools: any[] = [];
-
-            const normalizeSchema = (schema: any) => {
-              if (schema && typeof schema === "object") {
-                return schema;
-              }
-              toolDebugMissing += 1;
-              return { type: "object", properties: {} };
-            };
-
-            requestPayload.tools.forEach((tool: any, idx: number) => {
-              const pushDeclaration = (decl: any, source: string) => {
-                const schema =
-                  decl?.parameters ||
-                  decl?.input_schema ||
-                  decl?.inputSchema ||
-                  tool.parameters ||
-                  tool.input_schema ||
-                  tool.inputSchema ||
-                  tool.function?.parameters ||
-                  tool.function?.input_schema ||
-                  tool.function?.inputSchema ||
-                  tool.custom?.parameters ||
-                  tool.custom?.input_schema;
-
-                const name =
-                  decl?.name ||
-                  tool.name ||
-                  tool.function?.name ||
-                  tool.custom?.name ||
-                  `tool-${functionDeclarations.length}`;
-
-                const description =
-                  decl?.description ||
-                  tool.description ||
-                  tool.function?.description ||
-                  tool.custom?.description ||
-                  "";
-
-                functionDeclarations.push({
-                  name,
-                  description,
-                  parameters: normalizeSchema(schema),
-                });
-
-                toolDebugSummaries.push(
-                  `decl=${name},src=${source},hasSchema=${schema ? "y" : "n"}`,
-                );
-              };
-
-              if (Array.isArray(tool.functionDeclarations) && tool.functionDeclarations.length > 0) {
-                tool.functionDeclarations.forEach((decl: any) => pushDeclaration(decl, "functionDeclarations"));
-                return;
-              }
-
-              // Fall back to function/custom style definitions.
-              if (
-                tool.function ||
-                tool.custom ||
-                tool.parameters ||
-                tool.input_schema ||
-                tool.inputSchema
-              ) {
-                pushDeclaration(tool.function ?? tool.custom ?? tool, "function/custom");
-                return;
-              }
-
-              // Preserve any non-function tool entries (e.g., codeExecution) untouched.
-              passthroughTools.push(tool);
-            });
-
-            const finalTools: any[] = [];
-            if (functionDeclarations.length > 0) {
-              finalTools.push({ functionDeclarations });
-            }
-            requestPayload.tools = finalTools.concat(passthroughTools);
-          } else {
-            // Default normalization for non-Claude models
-            requestPayload.tools = requestPayload.tools.map((tool: any, toolIndex: number) => {
-              const newTool = { ...tool };
-
-              const schemaCandidates = [
-                newTool.function?.input_schema,
-                newTool.function?.parameters,
-                newTool.function?.inputSchema,
-                newTool.custom?.input_schema,
-                newTool.custom?.parameters,
-                newTool.parameters,
-                newTool.input_schema,
-                newTool.inputSchema,
-              ].filter(Boolean);
-              const schema = schemaCandidates[0];
-
-              const nameCandidate =
-                newTool.name ||
-                newTool.function?.name ||
-                newTool.custom?.name ||
-                `tool-${toolIndex}`;
-
-              if (newTool.function && !newTool.function.input_schema && schema) {
-                newTool.function.input_schema = schema;
-              }
-              if (newTool.custom && !newTool.custom.input_schema && schema) {
-                newTool.custom.input_schema = schema;
-              }
-              if (!newTool.custom && newTool.function) {
-                newTool.custom = {
-                  name: newTool.function.name || nameCandidate,
-                  description: newTool.function.description,
-                  input_schema: schema ?? { type: "object", properties: {} },
-                };
-              }
-              if (!newTool.custom && !newTool.function) {
-                newTool.custom = {
-                  name: nameCandidate,
-                  description: newTool.description,
-                  input_schema: schema ?? { type: "object", properties: {} },
-                };
-              }
-              if (newTool.custom && !newTool.custom.input_schema) {
-                newTool.custom.input_schema = { type: "object", properties: {} };
-                toolDebugMissing += 1;
-              }
-
-              toolDebugSummaries.push(
-                `idx=${toolIndex}, hasCustom=${!!newTool.custom}, customSchema=${!!newTool.custom?.input_schema}, hasFunction=${!!newTool.function}, functionSchema=${!!newTool.function?.input_schema}`,
-              );
-
-              // Strip custom wrappers for Gemini; only function-style is accepted.
-              if (newTool.custom) {
-                delete newTool.custom;
-              }
-
-              return newTool;
-            });
-          }
-
-          try {
-            toolDebugPayload = JSON.stringify(requestPayload.tools);
-          } catch {
-            toolDebugPayload = undefined;
-          }
-        }
-
-        // For Claude models, filter out unsigned thinking blocks (required by Claude API)
-        if (isClaudeModel && Array.isArray(requestPayload.contents)) {
-          requestPayload.contents = requestPayload.contents.map((content: any) => {
-            if (!content || !Array.isArray(content.parts)) {
-              return content;
-            }
-
-            const filteredParts = content.parts.filter((part: any) => {
-              if (!part || typeof part !== "object") {
-                return true;
-              }
-              // Remove thinking blocks without signatures
-              if (part.thinking !== undefined || part.type === "thinking" || part.type === "reasoning") {
-                return part.signature || part.thinking?.signature;
-              }
-              // Remove thought parts without thoughtSignature (Gemini format)
-              if (part.thought === true) {
-                return part.thoughtSignature;
-              }
-              return true;
-            });
-
-            return { ...content, parts: filteredParts };
-          });
-        }
-
-        // For Claude models, ensure functionCall/tool use parts carry IDs (required by Anthropic).
-        // We use a two-pass approach: first collect all functionCalls and assign IDs,
-        // then match functionResponses to their corresponding calls using a FIFO queue per function name.
-        if (isClaudeModel && Array.isArray(requestPayload.contents)) {
-          let toolCallCounter = 0;
-          // Track pending call IDs per function name as a FIFO queue
-          const pendingCallIdsByName = new Map<string, string[]>();
-
-          // First pass: assign IDs to all functionCalls and collect them
-          requestPayload.contents = requestPayload.contents.map((content: any) => {
-            if (!content || !Array.isArray(content.parts)) {
-              return content;
-            }
-
-            const newParts = content.parts.map((part: any) => {
-              if (part && typeof part === "object" && part.functionCall) {
-                const call = { ...part.functionCall };
-                if (!call.id) {
-                  call.id = `tool-call-${++toolCallCounter}`;
-                }
-                const nameKey = typeof call.name === "string" ? call.name : `tool-${toolCallCounter}`;
-                // Push to the queue for this function name
-                const queue = pendingCallIdsByName.get(nameKey) || [];
-                queue.push(call.id);
-                pendingCallIdsByName.set(nameKey, queue);
-                return { ...part, functionCall: call };
-              }
-              return part;
-            });
-
-            return { ...content, parts: newParts };
-          });
-
-          // Second pass: match functionResponses to their corresponding calls (FIFO order)
-          requestPayload.contents = (requestPayload.contents as any[]).map((content: any) => {
-            if (!content || !Array.isArray(content.parts)) {
-              return content;
-            }
-
-            const newParts = content.parts.map((part: any) => {
-              if (part && typeof part === "object" && part.functionResponse) {
-                const resp = { ...part.functionResponse };
-                if (!resp.id && typeof resp.name === "string") {
-                  const queue = pendingCallIdsByName.get(resp.name);
-                  if (queue && queue.length > 0) {
-                    // Consume the first pending ID (FIFO order)
-                    resp.id = queue.shift();
-                    pendingCallIdsByName.set(resp.name, queue);
-                  }
-                }
-                return { ...part, functionResponse: resp };
-              }
-              return part;
-            });
-
-            return { ...content, parts: newParts };
-          });
-        }
-
-        if ("model" in requestPayload) {
-          delete requestPayload.model;
-        }
-
-        const effectiveProjectId = projectId?.trim() || generateSyntheticProjectId();
-        resolvedProjectId = effectiveProjectId;
-
-        const wrappedBody = {
-          project: effectiveProjectId,
-          model: upstreamModel,
-          request: requestPayload,
-        };
-
-        // Add additional Antigravity fields
-        Object.assign(wrappedBody, {
-          userAgent: "antigravity",
-          requestId: "agent-" + crypto.randomUUID(),
-        });
-        if (wrappedBody.request && typeof wrappedBody.request === 'object') {
-          (wrappedBody.request as any).sessionId = "-" + Math.floor(Math.random() * 9000000000000000000).toString();
-        }
-
-        body = JSON.stringify(wrappedBody);
-      }
-    } catch (error) {
-      throw error;
+      const wrappedBody = wrapForAntigravity(transformedPayload, rawModel, projectId);
+      resolvedProjectId = wrappedBody.project as string;
+      body = JSON.stringify(wrappedBody);
     }
   }
 
-  if (streaming) {
-    headers.set("Accept", "text/event-stream");
-  }
-
-  headers.set("User-Agent", ANTIGRAVITY_HEADERS["User-Agent"]);
-  headers.set("X-Goog-Api-Client", ANTIGRAVITY_HEADERS["X-Goog-Api-Client"]);
-  headers.set("Client-Metadata", ANTIGRAVITY_HEADERS["Client-Metadata"]);
-  // Optional debug header to observe tool normalization on the backend if surfaced
-  if (toolDebugMissing > 0) {
-    headers.set("X-Opencode-Tools-Debug", String(toolDebugMissing));
-  }
+  // Setup headers
+  setupHeaders(headers, accessToken, isStreaming, toolDebugInfo.missing);
 
   return {
     request: transformedUrl,
-    init: {
-      ...baseInit,
-      headers,
-      body,
-    },
-    streaming,
+    init: { ...baseInit, headers, body },
+    streaming: isStreaming,
     requestedModel: rawModel,
-    effectiveModel: upstreamModel,
+    effectiveModel: rawModel,
     projectId: resolvedProjectId,
     endpoint: transformedUrl,
-    toolDebugMissing,
-    toolDebugSummary: toolDebugSummaries.slice(0, 20).join(" | "),
-    toolDebugPayload,
+    toolDebugMissing: toolDebugInfo.missing,
+    toolDebugSummary: toolDebugInfo.summaries.slice(0, 20).join(" | "),
+    toolDebugPayload: toolDebugInfo.payload,
   };
 }
+
+// ============================================================================
+// Response Transformation
+// ============================================================================
 
 /**
  * Normalizes Antigravity responses: applies retry headers, extracts cache usage into headers,
