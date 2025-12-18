@@ -385,7 +385,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
             // Show toast when switching to a different account
             const isAccountSwitch = previousAccountIndex !== null && previousAccountIndex !== account.index;
-            if (isAccountSwitch || previousAccountIndex === null) {
+            if ((isAccountSwitch || previousAccountIndex === null) && accountCount > 1) {
               const accountLabel = account.email || `Account ${account.index + 1}`;
               await showToast(
                 `Using ${accountLabel}${accountCount > 1 ? ` (${account.index + 1}/${accountCount})` : ""}`,
