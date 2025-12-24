@@ -143,3 +143,42 @@ describe("DCP Compatibility", () => {
     });
   });
 });
+
+describe("DCP Compatibility - OpenCode Internal Format (parts)", () => {
+  interface PartsMessage {
+    role: string;
+    parts: Array<{ type: string; text?: string; thinking?: string }>;
+  }
+
+  it("injects redacted_thinking for parts array starting with text", () => {
+    const messages: PartsMessage[] = [
+      {
+        role: "assistant",
+        parts: [{ type: "text", text: "DCP synthetic message" }],
+      },
+    ];
+    const result = fixDcpSyntheticMessages(messages) as PartsMessage[];
+
+    expect(result[0].parts).toHaveLength(2);
+    expect(result[0].parts[0].type).toBe("redacted_thinking");
+    expect(result[0].parts[1].type).toBe("text");
+  });
+
+  it("passes through parts array that already has thinking", () => {
+    const messages: PartsMessage[] = [
+      {
+        role: "assistant",
+        parts: [
+          { type: "thinking", thinking: "some thought" },
+          { type: "text", text: "response" },
+        ],
+      },
+    ];
+    expect(fixDcpSyntheticMessages(messages)).toEqual(messages);
+  });
+
+  it("handles message with neither content nor parts", () => {
+    const messages = [{ role: "assistant" }];
+    expect(fixDcpSyntheticMessages(messages)).toEqual(messages);
+  });
+});

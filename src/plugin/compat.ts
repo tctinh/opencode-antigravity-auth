@@ -37,13 +37,17 @@ export function fixDcpSyntheticMessages(messages: unknown[]): unknown[] {
     const msg = message as Record<string, unknown>;
     if (msg.role !== "assistant") return message;
     
-    const content = msg.content;
-    if (!Array.isArray(content)) return message;
+    // Handle both 'content' (Claude API) and 'parts' (OpenCode internal)
+    const contentKey = msg.content ? "content" : msg.parts ? "parts" : null;
+    if (!contentKey) return message;
     
-    const fixedContent = ensureThinkingBlockInContent(content);
-    if (fixedContent === content) return message;
+    const contentArray = msg[contentKey];
+    if (!Array.isArray(contentArray)) return message;
     
-    return { ...msg, content: fixedContent };
+    const fixedContent = ensureThinkingBlockInContent(contentArray);
+    if (fixedContent === contentArray) return message;
+    
+    return { ...msg, [contentKey]: fixedContent };
   });
 }
 
