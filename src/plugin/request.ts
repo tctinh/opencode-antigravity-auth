@@ -25,6 +25,10 @@ import {
   resolveThinkingConfig,
   rewriteAntigravityPreviewAccessError,
   transformThinkingParts,
+  recoverToolResponseID,
+  sanitizeThinkingForClaude,
+  validateToolPairing,
+  BYPASS_SIGNATURE,
   type AntigravityApiBody,
 } from "./request-helpers";
 
@@ -1195,7 +1199,18 @@ export function prepareAntigravityRequest(
             requestPayload.messages = ensureThinkingBeforeToolUseInMessages(requestPayload.messages, signatureSessionKey);
           }
 
-          // Step 3: Check if warmup needed (AFTER injection attempt)
+          // Step 3: Apply robust thinking sanitization with bypass signature fallback
+          // This handles edge cases like session restart, context compaction, and tool loop mid-turn
+          // See: docs/CLAUDE_MULTI_TURN_BUG_SPEC.md
+          if (isClaudeThinkingModel && Array.isArray(requestPayload.contents)) {
+            requestPayload.contents = sanitizeThinkingForClaude(
+              requestPayload.contents,
+              true, // thinking enabled for thinking-capable models
+              (sessionId: string, text: string) => getCachedSignature(sessionId, text)
+            );
+          }
+
+          // Step 4: Check if warmup needed (AFTER sanitization)
           if (isClaudeThinkingModel) {
             const hasToolUse =
               (Array.isArray(requestPayload.contents) && hasToolUseInContents(requestPayload.contents)) ||
@@ -1210,11 +1225,14 @@ export function prepareAntigravityRequest(
 
         // For Claude models, ensure functionCall/tool use parts carry IDs (required by Anthropic).
         // We use a two-pass approach: first collect all functionCalls and assign IDs,
-        // then match functionResponses to their corresponding calls using a FIFO queue per function name.
+        // then match functionResponses to their corresponding calls using multi-level ID recovery.
+        // See: docs/CLAUDE_MULTI_TURN_BUG_SPEC.md
         if (isClaudeModel && Array.isArray(requestPayload.contents)) {
           let toolCallCounter = 0;
           // Track pending call IDs per function name as a FIFO queue
           const pendingCallIdsByName = new Map<string, string[]>();
+          // Track all orphaned call IDs for recovery fallback
+          const allCallIds: string[] = [];
 
           // First pass: assign IDs to all functionCalls and collect them
           requestPayload.contents = requestPayload.contents.map((content: any) => {
@@ -1233,6 +1251,7 @@ export function prepareAntigravityRequest(
                 const queue = pendingCallIdsByName.get(nameKey) || [];
                 queue.push(call.id);
                 pendingCallIdsByName.set(nameKey, queue);
+                allCallIds.push(call.id);
                 return { ...part, functionCall: call };
               }
               return part;
@@ -1241,7 +1260,10 @@ export function prepareAntigravityRequest(
             return { ...content, parts: newParts };
           });
 
-          // Second pass: match functionResponses to their corresponding calls (FIFO order)
+          // Collect matched response IDs to find orphaned calls
+          const matchedResponseIds = new Set<string>();
+
+          // Second pass: match functionResponses to their corresponding calls with multi-level recovery
           requestPayload.contents = (requestPayload.contents as any[]).map((content: any) => {
             if (!content || !Array.isArray(content.parts)) {
               return content;
@@ -1250,13 +1272,23 @@ export function prepareAntigravityRequest(
             const newParts = content.parts.map((part: any) => {
               if (part && typeof part === "object" && part.functionResponse) {
                 const resp = { ...part.functionResponse };
-                if (!resp.id && typeof resp.name === "string") {
-                  const queue = pendingCallIdsByName.get(resp.name);
-                  if (queue && queue.length > 0) {
-                    // Consume the first pending ID (FIFO order)
-                    resp.id = queue.shift();
-                    pendingCallIdsByName.set(resp.name, queue);
+                if (!resp.id) {
+                  // Use multi-level ID recovery from request-helpers
+                  const orphanedCalls = allCallIds.filter(id => !matchedResponseIds.has(id));
+                  const recovery = recoverToolResponseID(
+                    { name: resp.name, id: resp.id },
+                    pendingCallIdsByName,
+                    orphanedCalls
+                  );
+                  resp.id = recovery.id;
+                  matchedResponseIds.add(recovery.id);
+                  
+                  // Log warning if recovery was non-trivial
+                  if (recovery.warning) {
+                    console.warn(`[Antigravity] ${recovery.warning}`);
                   }
+                } else {
+                  matchedResponseIds.add(resp.id);
                 }
                 return { ...part, functionResponse: resp };
               }

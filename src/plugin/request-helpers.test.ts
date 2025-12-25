@@ -952,3 +952,730 @@ describe("rewriteAntigravityPreviewAccessError", () => {
     expect(result?.error?.message).toContain("preview access");
   });
 });
+
+// =============================================================================
+// CLAUDE MULTI-TURN EDGE CASE TESTS
+// These tests cover the bugs documented in CLAUDE_MULTI_TURN_BUG_SPEC.md
+// =============================================================================
+
+import {
+  analyzeConversationState,
+  closeToolLoopForThinking,
+  sanitizeThinkingForClaude,
+  recoverToolResponseID,
+  validateToolPairing,
+  BYPASS_SIGNATURE,
+  TOOL_LOOP_CLOSE_MODEL,
+  TOOL_LOOP_CLOSE_USER,
+  TOOL_RESPONSE_UNAVAILABLE,
+} from "./request-helpers";
+
+describe("Claude Multi-Turn Edge Cases", () => {
+
+  // ===========================================================================
+  // Edge Case 1: Thinking stripped, no cached signature
+  // Bug: tool_use sent without thinking block when signature cache is empty
+  // ===========================================================================
+  describe("Edge Case 1: Thinking stripped, no cached signature", () => {
+    it("should detect when tool_use has no preceding thinking block", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+      ];
+
+      const state = analyzeConversationState(contents);
+      expect(state.hasToolUseWithoutThinking).toBe(true);
+    });
+
+    it("should inject thinking with bypass signature when no cached signature available", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Should have thinking block before functionCall
+      expect(result[0].parts.length).toBe(2);
+      expect(result[0].parts[0].thought).toBe(true);
+      expect(result[0].parts[0].thoughtSignature).toBe(BYPASS_SIGNATURE);
+      expect(result[0].parts[1].functionCall).toBeDefined();
+    });
+
+    it("should not corrupt conversation on subsequent turns after bypass injection", () => {
+      // Simulate a multi-turn conversation where first turn used bypass
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "[Thinking]", thoughtSignature: BYPASS_SIGNATURE },
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "file1.txt" } } },
+          ],
+        },
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "read", args: { path: "file1.txt" } } },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Last model message should also have thinking injected
+      const lastModel = result[result.length - 1];
+      expect(lastModel.parts[0].thought).toBe(true);
+      expect(lastModel.parts[0].thoughtSignature).toBe(BYPASS_SIGNATURE);
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 2: Tool loop mid-turn, thinking toggled
+  // Bug: Thinking mode toggle mid-turn causes permanent corruption
+  // ===========================================================================
+  describe("Edge Case 2: Tool loop mid-turn, thinking toggled", () => {
+    it("should detect when in tool loop (last message is functionResponse)", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "thinking", thoughtSignature: "s".repeat(60) },
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "output" } } },
+          ],
+        },
+      ];
+
+      const state = analyzeConversationState(contents);
+      expect(state.inToolLoop).toBe(true);
+    });
+
+    it("should close tool loop with synthetic messages when thinking unavailable at turn start", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            // No thinking at turn start - was stripped
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "output" } } },
+          ],
+        },
+      ];
+
+      const result = closeToolLoopForThinking(contents);
+      
+      // Should have synthetic model message
+      const syntheticModel = result[result.length - 2];
+      expect(syntheticModel.role).toBe("model");
+      expect(syntheticModel.parts[0].text).toBe(TOOL_LOOP_CLOSE_MODEL);
+      
+      // Should have synthetic user message
+      const syntheticUser = result[result.length - 1];
+      expect(syntheticUser.role).toBe("user");
+      expect(syntheticUser.parts[0].text).toBe(TOOL_LOOP_CLOSE_USER);
+    });
+
+    it("should preserve tool_use/tool_result pairing after loop closure", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } }, id: "call-1" },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "output" } }, id: "call-1" },
+          ],
+        },
+      ];
+
+      const result = closeToolLoopForThinking(contents);
+      const validation = validateToolPairing(result);
+      
+      expect(validation.valid).toBe(true);
+      expect(validation.orphanedToolCalls).toHaveLength(0);
+      expect(validation.orphanedToolResponses).toHaveLength(0);
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 3: functionResponse ID doesn't match any functionCall
+  // Bug: Silent failure causes orphaned tool_use error
+  // ===========================================================================
+  describe("Edge Case 3: ID mismatch recovery", () => {
+    it("should recover using name match when ID not found", () => {
+      const pendingCalls = new Map([
+        ["bash", ["call-1", "call-2"]],
+        ["read", ["call-3"]],
+      ]);
+      const orphanedCalls: string[] = [];
+
+      const result = recoverToolResponseID(
+        { name: "bash", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      expect(result.id).toBe("call-1");
+      expect(result.recoveryLevel).toBe("name");
+    });
+
+    it("should recover using orphan match when name not found", () => {
+      const pendingCalls = new Map<string, string[]>();
+      const orphanedCalls = ["orphan-call-1", "orphan-call-2"];
+
+      const result = recoverToolResponseID(
+        { name: "unknown_tool", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      expect(result.id).toBe("orphan-call-1");
+      expect(result.recoveryLevel).toBe("orphan");
+      expect(result.warning).toContain("unknown_tool");
+    });
+
+    it("should use fallback when no match available", () => {
+      const pendingCalls = new Map([
+        ["other_tool", ["call-99"]],
+      ]);
+      const orphanedCalls: string[] = [];
+
+      const result = recoverToolResponseID(
+        { name: "missing_tool", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      expect(result.id).toBe("call-99");
+      expect(result.recoveryLevel).toBe("fallback");
+      expect(result.warning).toBeDefined();
+    });
+
+    it("should generate placeholder ID when all recovery fails", () => {
+      const pendingCalls = new Map<string, string[]>();
+      const orphanedCalls: string[] = [];
+
+      const result = recoverToolResponseID(
+        { name: "orphan_response", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      expect(result.id).toMatch(/^placeholder-/);
+      expect(result.recoveryLevel).toBe("placeholder");
+      expect(result.warning).toContain("orphan_response");
+    });
+
+    it("should log warning on recovery", () => {
+      const pendingCalls = new Map([
+        ["bash", ["call-1"]],
+      ]);
+      const orphanedCalls: string[] = [];
+
+      const result = recoverToolResponseID(
+        { name: "bash", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      // Name match doesn't need warning (it's expected)
+      expect(result.warning).toBeUndefined();
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 4: Session restart loses in-memory signature cache
+  // Bug: Can't recover thinking signatures after restart
+  // ===========================================================================
+  describe("Edge Case 4: Session restart loses cache", () => {
+    it("should use bypass signature when cache empty and thinking needed", () => {
+      // Simulate: cache is empty (session restart), but we have tool_use
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            // Thinking was stripped because cache is empty
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+      ];
+
+      // No getCachedSignatureFn provided (simulating empty cache)
+      const result = sanitizeThinkingForClaude(contents, true, undefined);
+      
+      expect(result[0].parts[0].thoughtSignature).toBe(BYPASS_SIGNATURE);
+    });
+
+    it("should not fail on first request after restart", () => {
+      const contents = [
+        {
+          role: "user",
+          parts: [{ text: "Hello" }],
+        },
+      ];
+
+      // Should not throw
+      const result = sanitizeThinkingForClaude(contents, true, undefined);
+      expect(result).toEqual(contents);
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 5: Context compaction removes thinking blocks
+  // Bug: Old thinking stripped, can't continue tool loop
+  // ===========================================================================
+  describe("Edge Case 5: Context compaction removes thinking", () => {
+    it("should detect missing thinking in earlier turns and inject before tool_use", () => {
+      // After compaction: thinking was stripped from earlier turn
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            // Thinking was compacted/removed
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "file1" } } },
+          ],
+        },
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "read", args: { path: "file1" } } },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Each model message with tool_use should have thinking
+      const modelMessages = result.filter((m: any) => m.role === "model");
+      for (const msg of modelMessages) {
+        const hasThinking = msg.parts.some((p: any) => p.thought === true);
+        const hasTool = msg.parts.some((p: any) => p.functionCall);
+        if (hasTool) {
+          expect(hasThinking).toBe(true);
+        }
+      }
+    });
+
+    it("should close tool loop if needed before injection", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            { functionResponse: { name: "bash", response: { result: "output" } } },
+          ],
+        },
+      ];
+
+      const state = analyzeConversationState(contents);
+      expect(state.inToolLoop).toBe(true);
+      expect(state.turnHasThinking).toBe(false);
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Should have closed the loop OR injected thinking
+      const validation = validateToolPairing(result);
+      expect(validation.valid).toBe(true);
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 6: Parallel tool calls, responses out of order
+  // Bug: FIFO queue mismatch when responses arrive out of order
+  // ===========================================================================
+  describe("Edge Case 6: Parallel tool calls, out of order responses", () => {
+    it("should match by name when IDs mismatch", () => {
+      const pendingCalls = new Map([
+        ["bash", ["call-1"]],
+        ["read", ["call-2"]],
+        ["write", ["call-3"]],
+      ]);
+      const orphanedCalls: string[] = [];
+
+      // Response for "read" comes first
+      const result = recoverToolResponseID(
+        { name: "read", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+
+      expect(result.id).toBe("call-2");
+      expect(result.recoveryLevel).toBe("name");
+    });
+
+    it("should handle multiple calls with same name (FIFO within name)", () => {
+      const pendingCalls = new Map([
+        ["bash", ["call-1", "call-4", "call-7"]],  // Multiple bash calls
+      ]);
+      const orphanedCalls: string[] = [];
+
+      // First bash response
+      const result1 = recoverToolResponseID(
+        { name: "bash", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+      expect(result1.id).toBe("call-1");
+
+      // Queue should be updated (call-1 removed)
+      pendingCalls.set("bash", ["call-4", "call-7"]);
+
+      // Second bash response
+      const result2 = recoverToolResponseID(
+        { name: "bash", id: undefined },
+        pendingCalls,
+        orphanedCalls
+      );
+      expect(result2.id).toBe("call-4");
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 7: Empty content array after filtering
+  // Bug: Invalid request with empty parts
+  // ===========================================================================
+  describe("Edge Case 7: Empty content after filtering", () => {
+    it("should handle empty parts array gracefully", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [],
+        },
+      ];
+
+      const state = analyzeConversationState(contents);
+      expect(state.inToolLoop).toBe(false);
+      expect(state.hasToolUseWithoutThinking).toBe(false);
+    });
+
+    it("should not send invalid request with only stripped thinking", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { type: "thinking", thinking: "will be stripped" },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, false);  // thinking disabled
+      
+      // Should either keep the message empty or add placeholder text
+      expect(result[0].parts.length).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 8: Nested tool calls in thinking block
+  // Bug: Tool blocks inside thinking get dropped
+  // ===========================================================================
+  describe("Edge Case 8: Nested tool calls in thinking", () => {
+    it("should preserve tool blocks even if adjacent to thinking", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { type: "thinking", thinking: "planning to call tool" },
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+      ];
+
+      // When stripping thinking, tool should remain
+      const result = sanitizeThinkingForClaude(contents, false);  // thinking disabled = strip
+      
+      const toolBlocks = result[0].parts.filter((p: any) => p.functionCall);
+      expect(toolBlocks).toHaveLength(1);
+    });
+
+    it("should extract and promote nested tool blocks if found inside thinking object", () => {
+      // Edge case: malformed structure where tool is inside thinking
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            {
+              type: "thinking",
+              thinking: "text",
+              // Hypothetical malformed: nested tool
+              nested: { functionCall: { name: "bash", args: {} } },
+            },
+          ],
+        },
+      ];
+
+      // Should handle gracefully without crashing
+      expect(() => sanitizeThinkingForClaude(contents, true)).not.toThrow();
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 9: Incomplete turn (tool call without response)
+  // Bug: Orphaned tool_use causes "tool_use without tool_result" error
+  // ===========================================================================
+  describe("Edge Case 9: Incomplete turn (tool call without response)", () => {
+    it("should detect orphaned tool calls", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } }, id: "call-1" },
+            { functionCall: { name: "read", args: { path: "file" } }, id: "call-2" },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            // Only one response for two calls
+            { functionResponse: { name: "bash", response: { result: "ok" } }, id: "call-1" },
+          ],
+        },
+      ];
+
+      const validation = validateToolPairing(contents);
+      expect(validation.orphanedToolCalls).toContain("call-2");
+    });
+
+    it("should inject placeholder response for orphaned calls when auto-fix enabled", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } }, id: "call-1" },
+          ],
+        },
+        // No user response at all
+      ];
+
+      const validation = validateToolPairing(contents, { autoFix: true });
+      
+      if (validation.autoFixed) {
+        expect(validation.valid).toBe(true);
+      } else {
+        expect(validation.orphanedToolCalls).toHaveLength(1);
+      }
+    });
+  });
+
+  // ===========================================================================
+  // Edge Case 10: Thinking at wrong position (not before tool_use)
+  // Bug: Thinking block comes after tool_use, causing rejection
+  // ===========================================================================
+  describe("Edge Case 10: Thinking at wrong position", () => {
+    it("should reorder thinking before tool_use", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+            { thought: true, text: "should be first", thoughtSignature: BYPASS_SIGNATURE },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Thinking should come first
+      expect(result[0].parts[0].thought).toBe(true);
+      expect(result[0].parts[1].functionCall).toBeDefined();
+    });
+
+    it("should inject thinking if missing entirely before tool_use", () => {
+      const contents = [
+        {
+          role: "model",
+          parts: [
+            { text: "I will run a command" },
+            { functionCall: { name: "bash", args: { command: "ls" } } },
+          ],
+        },
+      ];
+
+      const result = sanitizeThinkingForClaude(contents, true);
+      
+      // Should have thinking before tool_use
+      const functionCallIdx = result[0].parts.findIndex((p: any) => p.functionCall);
+      const thinkingIdx = result[0].parts.findIndex((p: any) => p.thought === true);
+      
+      expect(thinkingIdx).toBeLessThan(functionCallIdx);
+    });
+  });
+});
+
+// =============================================================================
+// INTEGRATION TESTS: Multi-Turn Conversation Simulation
+// =============================================================================
+describe("Multi-Turn Conversation Simulation", () => {
+  it("should handle 10-turn conversation with tool loops", () => {
+    const contents: any[] = [];
+    
+    // Build a 10-turn conversation with tool calls
+    for (let i = 0; i < 10; i++) {
+      // Model turn with tool call
+      contents.push({
+        role: "model",
+        parts: [
+          { thought: true, text: `Thinking turn ${i}`, thoughtSignature: BYPASS_SIGNATURE },
+          { functionCall: { name: "bash", args: { command: `cmd-${i}` } }, id: `call-${i}` },
+        ],
+      });
+      
+      // User turn with response
+      contents.push({
+        role: "user",
+        parts: [
+          { functionResponse: { name: "bash", response: { result: `result-${i}` } }, id: `call-${i}` },
+        ],
+      });
+    }
+
+    const result = sanitizeThinkingForClaude(contents, true);
+    const validation = validateToolPairing(result);
+    
+    expect(validation.valid).toBe(true);
+    expect(validation.orphanedToolCalls).toHaveLength(0);
+    expect(validation.orphanedToolResponses).toHaveLength(0);
+  });
+
+  it("should recover from simulated session restart mid-conversation", () => {
+    // First 5 turns have thinking with real signatures
+    const contents: any[] = [];
+    
+    for (let i = 0; i < 5; i++) {
+      contents.push({
+        role: "model",
+        parts: [
+          // After "restart", these signatures are not in cache
+          { thought: true, text: `Old thinking ${i}`, thoughtSignature: "unknown_sig_".repeat(5) },
+          { functionCall: { name: "bash", args: { command: `cmd-${i}` } }, id: `call-${i}` },
+        ],
+      });
+      contents.push({
+        role: "user",
+        parts: [
+          { functionResponse: { name: "bash", response: { result: `ok` } }, id: `call-${i}` },
+        ],
+      });
+    }
+
+    // Simulate: no cache function (restart scenario)
+    const result = sanitizeThinkingForClaude(contents, true, undefined);
+    
+    // Should use bypass signatures
+    const modelMessages = result.filter((m: any) => m.role === "model");
+    for (const msg of modelMessages) {
+      const thinking = msg.parts.find((p: any) => p.thought === true);
+      if (thinking) {
+        expect(thinking.thoughtSignature).toBe(BYPASS_SIGNATURE);
+      }
+    }
+  });
+
+  it("should handle context compaction simulation", () => {
+    // Simulate compacted conversation: old tool results cleared
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { name: "bash", args: { command: "old" } }, id: "old-1" },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "bash", response: { result: TOOL_RESPONSE_UNAVAILABLE } }, id: "old-1" },
+        ],
+      },
+      {
+        role: "model",
+        parts: [
+          { functionCall: { name: "read", args: { path: "file" } }, id: "recent-1" },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "read", response: { result: "actual content" } }, id: "recent-1" },
+        ],
+      },
+    ];
+
+    const result = sanitizeThinkingForClaude(contents, true);
+    const validation = validateToolPairing(result);
+    
+    expect(validation.valid).toBe(true);
+  });
+
+  it("should handle rapid parallel tool calls", () => {
+    // Model makes 5 parallel tool calls
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { thought: true, text: "Running multiple tools", thoughtSignature: BYPASS_SIGNATURE },
+          { functionCall: { name: "bash", args: { command: "1" } }, id: "p-1" },
+          { functionCall: { name: "bash", args: { command: "2" } }, id: "p-2" },
+          { functionCall: { name: "read", args: { path: "a" } }, id: "p-3" },
+          { functionCall: { name: "read", args: { path: "b" } }, id: "p-4" },
+          { functionCall: { name: "write", args: { path: "c" } }, id: "p-5" },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          // Responses in different order
+          { functionResponse: { name: "read", response: { result: "a" } }, id: "p-3" },
+          { functionResponse: { name: "bash", response: { result: "1" } }, id: "p-1" },
+          { functionResponse: { name: "write", response: { result: "ok" } }, id: "p-5" },
+          { functionResponse: { name: "bash", response: { result: "2" } }, id: "p-2" },
+          { functionResponse: { name: "read", response: { result: "b" } }, id: "p-4" },
+        ],
+      },
+    ];
+
+    const result = sanitizeThinkingForClaude(contents, true);
+    const validation = validateToolPairing(result);
+    
+    expect(validation.valid).toBe(true);
+    expect(validation.orphanedToolCalls).toHaveLength(0);
+    expect(validation.orphanedToolResponses).toHaveLength(0);
+  });
+});

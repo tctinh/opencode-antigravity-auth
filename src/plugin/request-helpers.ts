@@ -1371,3 +1371,605 @@ function isAntigravityModel(target?: string): boolean {
   // Check for Antigravity models instead of Gemini 3
   return /antigravity/i.test(target) || /opus/i.test(target) || /claude/i.test(target);
 }
+
+// =============================================================================
+// CLAUDE MULTI-TURN TOOL PAIRING FIX
+// Ported from LLM-API-Key-Proxy's _sanitize_thinking_for_claude with
+// CLIProxyAPI's skip_thought_signature_validator bypass
+// See: docs/CLAUDE_MULTI_TURN_BUG_SPEC.md
+// =============================================================================
+
+/**
+ * Bypass signature used when no valid signature is available.
+ * This is accepted by Antigravity/Claude to skip signature validation.
+ * Ported from CLIProxyAPI and LLM-API-Key-Proxy.
+ */
+export const BYPASS_SIGNATURE = "skip_thought_signature_validator";
+
+/**
+ * Synthetic message content for closing tool loops.
+ * Used when thinking mode is toggled mid-turn.
+ */
+export const TOOL_LOOP_CLOSE_MODEL = "[Tool loop closed for thinking continuation]";
+export const TOOL_LOOP_CLOSE_USER = "[Continue]";
+
+/**
+ * Placeholder for unavailable tool responses.
+ * Matches OpenCode's compaction pattern: "[Old tool result content cleared]"
+ */
+export const TOOL_RESPONSE_UNAVAILABLE = "[Tool response unavailable]";
+
+/**
+ * Error message for incomplete tool execution.
+ * Matches OpenCode's error pattern: "Tool execution failed: ..."
+ */
+export const TOOL_INCOMPLETE_ERROR = "Tool execution incomplete: no response received";
+
+/**
+ * Result of conversation state analysis.
+ */
+export interface ConversationState {
+  /** True if the last message is a functionResponse (in tool loop) */
+  inToolLoop: boolean;
+  /** True if the current turn's first model message has a thinking block */
+  turnHasThinking: boolean;
+  /** Index of the current turn's first message */
+  turnStartIdx: number;
+  /** Index of the last assistant/model message */
+  lastAssistantIdx: number;
+  /** True if any model message has tool_use without preceding thinking */
+  hasToolUseWithoutThinking: boolean;
+  /** IDs of tool calls without matching responses */
+  orphanedToolCalls: string[];
+  /** IDs of tool responses without matching calls */
+  orphanedToolResponses: string[];
+}
+
+/**
+ * Result of ID recovery attempt.
+ */
+export interface IDRecoveryResult {
+  /** The recovered or generated ID */
+  id: string;
+  /** How the ID was recovered */
+  recoveryLevel: "exact" | "name" | "orphan" | "fallback" | "placeholder";
+  /** Warning message if recovery was non-trivial */
+  warning?: string;
+}
+
+/**
+ * Result of tool pairing validation.
+ */
+export interface ValidationResult {
+  /** True if all tool calls have matching responses */
+  valid: boolean;
+  /** Error messages */
+  errors: string[];
+  /** Warning messages */
+  warnings: string[];
+  /** True if auto-fix was applied */
+  autoFixed: boolean;
+  /** IDs of tool calls without responses */
+  orphanedToolCalls: string[];
+  /** IDs of tool responses without calls */
+  orphanedToolResponses: string[];
+}
+
+/**
+ * Options for validation.
+ */
+export interface ValidationOptions {
+  /** If true, attempt to auto-fix issues */
+  autoFix?: boolean;
+}
+
+/**
+ * Checks if a part is a functionCall (tool_use).
+ */
+function isFunctionCall(part: any): boolean {
+  return part && typeof part === "object" && part.functionCall !== undefined;
+}
+
+/**
+ * Checks if a part is a functionResponse (tool_result).
+ */
+function isFunctionResponse(part: any): boolean {
+  return part && typeof part === "object" && part.functionResponse !== undefined;
+}
+
+/**
+ * Checks if a part is a thinking block.
+ */
+function isThinkingBlock(part: any): boolean {
+  if (!part || typeof part !== "object") return false;
+  return part.thought === true || part.type === "thinking";
+}
+
+/**
+ * Gets the ID from a functionCall or functionResponse part.
+ */
+function getPartId(part: any): string | undefined {
+  return part?.id;
+}
+
+/**
+ * Gets the function name from a part.
+ */
+function getPartName(part: any): string | undefined {
+  if (isFunctionCall(part)) {
+    return part.functionCall?.name;
+  }
+  if (isFunctionResponse(part)) {
+    return part.functionResponse?.name;
+  }
+  return undefined;
+}
+
+/**
+ * Analyzes conversation state to detect tool loops, missing thinking, and orphaned tools.
+ * Ported from LLM-API-Key-Proxy's conversation analysis logic.
+ */
+export function analyzeConversationState(contents: any[]): ConversationState {
+  const state: ConversationState = {
+    inToolLoop: false,
+    turnHasThinking: false,
+    turnStartIdx: -1,
+    lastAssistantIdx: -1,
+    hasToolUseWithoutThinking: false,
+    orphanedToolCalls: [],
+    orphanedToolResponses: [],
+  };
+
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return state;
+  }
+
+  // Track all tool call IDs and response IDs
+  const toolCallIds = new Map<string, string>(); // id -> name
+  const toolResponseIds = new Map<string, string>(); // id -> name
+
+  // Find last message and check if it's a functionResponse
+  const lastMessage = contents[contents.length - 1];
+  if (lastMessage?.role === "user" && Array.isArray(lastMessage.parts)) {
+    state.inToolLoop = lastMessage.parts.some((p: any) => isFunctionResponse(p));
+  }
+
+  // Find turn start (last user message that's not just functionResponse)
+  // and last assistant message
+  for (let i = contents.length - 1; i >= 0; i--) {
+    const msg = contents[i];
+    if (!msg || typeof msg !== "object") continue;
+
+    if ((msg.role === "model" || msg.role === "assistant") && state.lastAssistantIdx === -1) {
+      state.lastAssistantIdx = i;
+    }
+
+    // Turn starts at a user message that has non-functionResponse content
+    // or at the beginning
+    if (msg.role === "user" && Array.isArray(msg.parts)) {
+      const hasNonToolContent = msg.parts.some((p: any) => 
+        !isFunctionResponse(p) && (p.text || p.inlineData)
+      );
+      if (hasNonToolContent) {
+        state.turnStartIdx = i;
+        break;
+      }
+    }
+  }
+
+  // If no turn start found, start from beginning
+  if (state.turnStartIdx === -1) {
+    state.turnStartIdx = 0;
+  }
+
+  // Check if turn start has thinking
+  for (let i = state.turnStartIdx; i < contents.length; i++) {
+    const msg = contents[i];
+    if ((msg?.role === "model" || msg?.role === "assistant") && Array.isArray(msg.parts)) {
+      // First model message in this turn
+      state.turnHasThinking = msg.parts.some((p: any) => isThinkingBlock(p));
+      break;
+    }
+  }
+
+  // Check for tool_use without thinking and collect tool IDs
+  for (const msg of contents) {
+    if (!msg || typeof msg !== "object" || !Array.isArray(msg.parts)) continue;
+
+    if (msg.role === "model" || msg.role === "assistant") {
+      let hasThinkingBeforeTools = false;
+      let seenTool = false;
+
+      for (const part of msg.parts) {
+        if (isThinkingBlock(part) && !seenTool) {
+          hasThinkingBeforeTools = true;
+        }
+        if (isFunctionCall(part)) {
+          seenTool = true;
+          const id = getPartId(part);
+          const name = getPartName(part);
+          if (id) {
+            toolCallIds.set(id, name || "unknown");
+          }
+          if (!hasThinkingBeforeTools) {
+            state.hasToolUseWithoutThinking = true;
+          }
+        }
+      }
+    }
+
+    if (msg.role === "user") {
+      for (const part of msg.parts) {
+        if (isFunctionResponse(part)) {
+          const id = getPartId(part);
+          const name = getPartName(part);
+          if (id) {
+            toolResponseIds.set(id, name || "unknown");
+          }
+        }
+      }
+    }
+  }
+
+  // Find orphaned tool calls (calls without responses)
+  for (const [id] of toolCallIds) {
+    if (!toolResponseIds.has(id)) {
+      state.orphanedToolCalls.push(id);
+    }
+  }
+
+  // Find orphaned tool responses (responses without calls)
+  for (const [id] of toolResponseIds) {
+    if (!toolCallIds.has(id)) {
+      state.orphanedToolResponses.push(id);
+    }
+  }
+
+  return state;
+}
+
+/**
+ * Closes a tool loop by injecting synthetic model and user messages.
+ * Used when thinking mode needs to be enabled but we're mid-turn in a tool loop.
+ * Ported from LLM-API-Key-Proxy's _close_tool_loop_for_thinking.
+ */
+export function closeToolLoopForThinking(contents: any[]): any[] {
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return contents;
+  }
+
+  const result = [...contents];
+
+  // Inject synthetic model message
+  result.push({
+    role: "model",
+    parts: [{ text: TOOL_LOOP_CLOSE_MODEL }],
+  });
+
+  // Inject synthetic user message
+  result.push({
+    role: "user",
+    parts: [{ text: TOOL_LOOP_CLOSE_USER }],
+  });
+
+  return result;
+}
+
+/**
+ * Injects a thinking block with bypass signature before the first functionCall in a message.
+ */
+function injectThinkingBeforeFunctionCall(parts: any[]): any[] {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return parts;
+  }
+
+  const result: any[] = [];
+  let injected = false;
+
+  for (const part of parts) {
+    if (isFunctionCall(part) && !injected) {
+      // Inject thinking before first functionCall
+      result.push({
+        thought: true,
+        text: "[Thinking process]",
+        thoughtSignature: BYPASS_SIGNATURE,
+      });
+      injected = true;
+    }
+    result.push(part);
+  }
+
+  return result;
+}
+
+/**
+ * Reorders parts so thinking comes before functionCall.
+ */
+function reorderThinkingBeforeFunctionCall(parts: any[]): any[] {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return parts;
+  }
+
+  const thinkingParts: any[] = [];
+  const functionCallParts: any[] = [];
+  const otherParts: any[] = [];
+
+  for (const part of parts) {
+    if (isThinkingBlock(part)) {
+      thinkingParts.push(part);
+    } else if (isFunctionCall(part)) {
+      functionCallParts.push(part);
+    } else {
+      otherParts.push(part);
+    }
+  }
+
+  // Order: thinking first, then other content, then function calls
+  return [...thinkingParts, ...otherParts, ...functionCallParts];
+}
+
+/**
+ * Main thinking sanitization function for Claude models.
+ * Handles all edge cases for multi-turn conversations with tool loops.
+ * 
+ * Ported from LLM-API-Key-Proxy's _sanitize_thinking_for_claude with
+ * CLIProxyAPI's bypass signature fallback.
+ * 
+ * @param contents - The conversation contents array
+ * @param thinkingEnabled - Whether thinking mode is enabled
+ * @param getCachedSignatureFn - Optional function to get cached signatures
+ * @returns Sanitized contents array
+ */
+export function sanitizeThinkingForClaude(
+  contents: any[],
+  thinkingEnabled: boolean,
+  getCachedSignatureFn?: (sessionId: string, text: string) => string | undefined,
+): any[] {
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return contents;
+  }
+
+  // If thinking is disabled, strip all thinking blocks but preserve tool blocks
+  if (!thinkingEnabled) {
+    return contents.map((msg) => {
+      if (!msg || typeof msg !== "object" || !Array.isArray(msg.parts)) {
+        return msg;
+      }
+      
+      const filteredParts = msg.parts.filter((p: any) => {
+        // Always keep tool blocks
+        if (isFunctionCall(p) || isFunctionResponse(p)) {
+          return true;
+        }
+        // Remove thinking blocks
+        if (isThinkingBlock(p)) {
+          return false;
+        }
+        // Keep everything else
+        return true;
+      });
+
+      return { ...msg, parts: filteredParts };
+    });
+  }
+
+  // Analyze current conversation state
+  const state = analyzeConversationState(contents);
+
+  // If in tool loop without thinking at turn start, close the loop first
+  let workingContents = contents;
+  if (state.inToolLoop && !state.turnHasThinking) {
+    workingContents = closeToolLoopForThinking(contents);
+  }
+
+  // Process each message to ensure thinking before tool_use
+  const result = workingContents.map((msg) => {
+    if (!msg || typeof msg !== "object" || !Array.isArray(msg.parts)) {
+      return msg;
+    }
+
+    // Only process model/assistant messages
+    if (msg.role !== "model" && msg.role !== "assistant") {
+      return msg;
+    }
+
+    // Check if this message has functionCall
+    const hasFunctionCall = msg.parts.some((p: any) => isFunctionCall(p));
+    if (!hasFunctionCall) {
+      return msg;
+    }
+
+    // Check if thinking already exists before functionCall
+    let hasThinkingBeforeFunctionCall = false;
+    let seenFunctionCall = false;
+    
+    for (const part of msg.parts) {
+      if (isFunctionCall(part)) {
+        seenFunctionCall = true;
+      }
+      if (isThinkingBlock(part) && !seenFunctionCall) {
+        hasThinkingBeforeFunctionCall = true;
+        break;
+      }
+    }
+
+    if (hasThinkingBeforeFunctionCall) {
+      // Thinking exists, but may need to ensure it has valid signature
+      const updatedParts = msg.parts.map((part: any) => {
+        if (isThinkingBlock(part)) {
+          // If no signature, short signature, OR no way to verify (no cache fn), use bypass
+          // This handles session restart where cache is empty
+          const hasValidSignature = part.thoughtSignature && 
+            part.thoughtSignature.length >= 50 &&
+            part.thoughtSignature === BYPASS_SIGNATURE; // bypass is always valid
+          
+          if (!hasValidSignature && !getCachedSignatureFn) {
+            // No cache function = can't verify = use bypass
+            return {
+              ...part,
+              thoughtSignature: BYPASS_SIGNATURE,
+            };
+          }
+          if (!part.thoughtSignature || part.thoughtSignature.length < 50) {
+            return {
+              ...part,
+              thoughtSignature: BYPASS_SIGNATURE,
+            };
+          }
+        }
+        return part;
+      });
+      return { ...msg, parts: updatedParts };
+    }
+
+    // No thinking before functionCall - check if thinking exists but in wrong position
+    const hasAnyThinking = msg.parts.some((p: any) => isThinkingBlock(p));
+    
+    if (hasAnyThinking) {
+      // Reorder to put thinking first
+      const reorderedParts = reorderThinkingBeforeFunctionCall(msg.parts);
+      // Ensure bypass signature (same logic as above)
+      const updatedParts = reorderedParts.map((part: any) => {
+        if (isThinkingBlock(part)) {
+          const hasValidSignature = part.thoughtSignature && 
+            part.thoughtSignature.length >= 50 &&
+            part.thoughtSignature === BYPASS_SIGNATURE;
+          
+          if (!hasValidSignature && !getCachedSignatureFn) {
+            return { ...part, thoughtSignature: BYPASS_SIGNATURE };
+          }
+          if (!part.thoughtSignature || part.thoughtSignature.length < 50) {
+            return { ...part, thoughtSignature: BYPASS_SIGNATURE };
+          }
+        }
+        return part;
+      });
+      return { ...msg, parts: updatedParts };
+    }
+
+    // No thinking at all - inject with bypass signature
+    const injectedParts = injectThinkingBeforeFunctionCall(msg.parts);
+    return { ...msg, parts: injectedParts };
+  });
+
+  return result;
+}
+
+/**
+ * Recovers a tool response ID using multiple fallback strategies.
+ * 
+ * Ported from LLM-API-Key-Proxy's multi-level ID recovery logic.
+ * 
+ * @param resp - The response object needing an ID
+ * @param pendingCalls - Map of function names to pending call IDs
+ * @param orphanedCalls - Array of orphaned call IDs
+ * @returns Recovery result with ID and metadata
+ */
+export function recoverToolResponseID(
+  resp: { name?: string; id?: string },
+  pendingCalls: Map<string, string[]>,
+  orphanedCalls: string[],
+): IDRecoveryResult {
+  // Level 0: Already has ID
+  if (resp.id) {
+    return { id: resp.id, recoveryLevel: "exact" };
+  }
+
+  const respName = resp.name || "";
+
+  // Level 1: Match by name (FIFO within name group)
+  if (respName && pendingCalls.has(respName)) {
+    const queue = pendingCalls.get(respName)!;
+    if (queue.length > 0) {
+      const id = queue.shift()!;
+      return { id, recoveryLevel: "name" };
+    }
+  }
+
+  // Level 2: Match orphaned calls
+  if (orphanedCalls.length > 0) {
+    const id = orphanedCalls.shift()!;
+    return {
+      id,
+      recoveryLevel: "orphan",
+      warning: `ID recovery: matched '${respName}' response to orphaned call '${id}'`,
+    };
+  }
+
+  // Level 3: Fallback - take any available ID
+  for (const [name, queue] of pendingCalls) {
+    if (queue.length > 0) {
+      const id = queue.shift()!;
+      return {
+        id,
+        recoveryLevel: "fallback",
+        warning: `ID recovery: matched '${respName}' response to '${name}' call '${id}' (fallback)`,
+      };
+    }
+  }
+
+  // Level 4: Generate placeholder
+  const placeholderId = `placeholder-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id: placeholderId,
+    recoveryLevel: "placeholder",
+    warning: `ID recovery: generated placeholder for '${respName}' response (no matching call found)`,
+  };
+}
+
+/**
+ * Validates that all tool calls have matching responses and vice versa.
+ * Optionally auto-fixes issues by injecting placeholder responses.
+ * 
+ * @param contents - The conversation contents array
+ * @param options - Validation options
+ * @returns Validation result with details
+ */
+export function validateToolPairing(
+  contents: any[],
+  options: ValidationOptions = {},
+): ValidationResult {
+  const result: ValidationResult = {
+    valid: true,
+    errors: [],
+    warnings: [],
+    autoFixed: false,
+    orphanedToolCalls: [],
+    orphanedToolResponses: [],
+  };
+
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return result;
+  }
+
+  const state = analyzeConversationState(contents);
+  result.orphanedToolCalls = [...state.orphanedToolCalls];
+  result.orphanedToolResponses = [...state.orphanedToolResponses];
+
+  if (state.orphanedToolCalls.length > 0) {
+    result.valid = false;
+    result.errors.push(
+      `Found ${state.orphanedToolCalls.length} tool call(s) without responses: ${state.orphanedToolCalls.join(", ")}`
+    );
+  }
+
+  if (state.orphanedToolResponses.length > 0) {
+    result.warnings.push(
+      `Found ${state.orphanedToolResponses.length} tool response(s) without matching calls: ${state.orphanedToolResponses.join(", ")}`
+    );
+  }
+
+  if (state.hasToolUseWithoutThinking) {
+    result.warnings.push("Found tool_use without preceding thinking block");
+  }
+
+  // Auto-fix: This would require modifying the contents array
+  // For now, we just report - actual fix happens in sanitizeThinkingForClaude
+  if (options.autoFix && !result.valid) {
+    // Note: Auto-fix is handled by sanitizeThinkingForClaude
+    // This function is primarily for validation/reporting
+    result.autoFixed = false;
+  }
+
+  return result;
+}
