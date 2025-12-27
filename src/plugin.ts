@@ -970,6 +970,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   currentEndpoint,
                   headerStyle,
                   forceThinkingRecovery,
+                  { claudeToolHardening: config.claude_tool_hardening },
                 );
 
                 // Show thinking recovery toast (respects quiet mode)
@@ -1196,7 +1197,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   emptyResponseAttempts.delete(emptyAttemptKeyClean);
                 }
                 
-                return transformAntigravityResponse(
+                const transformedResponse = await transformAntigravityResponse(
                   response,
                   prepared.streaming,
                   debugContext,
@@ -1210,6 +1211,24 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   prepared.toolDebugPayload,
                   debugLines,
                 );
+
+                // Check for context errors and show appropriate toast
+                const contextError = transformedResponse.headers.get("x-antigravity-context-error");
+                if (contextError && !quietMode) {
+                  if (contextError === "prompt_too_long") {
+                    await showToast(
+                      "Context too long - use /compact to reduce size, or trim your request",
+                      "warning"
+                    );
+                  } else if (contextError === "tool_pairing") {
+                    await showToast(
+                      "Tool call/result mismatch - use /compact to fix, or /undo last message",
+                      "warning"
+                    );
+                  }
+                }
+
+                return transformedResponse;
               } catch (error) {
                 // Handle recoverable thinking errors - retry with forced recovery
                 if (error instanceof Error && error.message === "THINKING_RECOVERY_NEEDED") {

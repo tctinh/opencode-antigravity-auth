@@ -1,5 +1,9 @@
 import { KEEP_THINKING_BLOCKS } from "../constants.js";
 import { createLogger } from "./logger";
+import {
+  EMPTY_SCHEMA_PLACEHOLDER_NAME,
+  EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
+} from "../constants";
 
 const log = createLogger("request-helpers");
 
@@ -544,12 +548,12 @@ function addEmptySchemaPlaceholder(schema: any): any {
 
     if (!hasProperties) {
       result.properties = {
-        reason: {
-          type: "string",
-          description: "Brief explanation of why you are calling this tool",
+        [EMPTY_SCHEMA_PLACEHOLDER_NAME]: {
+          type: "boolean",
+          description: EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
         },
       };
-      result.required = ["reason"];
+      result.required = [EMPTY_SCHEMA_PLACEHOLDER_NAME];
     }
   }
 
@@ -626,6 +630,7 @@ export interface AntigravityUsageMetadata {
   promptTokenCount?: number;
   candidatesTokenCount?: number;
   cachedContentTokenCount?: number;
+  thoughtsTokenCount?: number;
 }
 
 /**
@@ -1151,19 +1156,23 @@ function transformGeminiCandidate(candidate: any): any {
     // Handle Gemini-style: thought: true
     if (part.thought === true) {
       thinkingTexts.push(part.text || "");
-      return { ...part, type: "reasoning" };
+      const transformed: Record<string, unknown> = { ...part, type: "reasoning" };
+      if (part.cache_control) transformed.cache_control = part.cache_control;
+      return transformed;
     }
 
     // Handle Anthropic-style in candidates: type: "thinking"
     if (part.type === "thinking") {
       const thinkingText = part.thinking || part.text || "";
       thinkingTexts.push(thinkingText);
-      return {
+      const transformed: Record<string, unknown> = {
         ...part,
         type: "reasoning",
         text: thinkingText,
         thought: true,
       };
+      if (part.cache_control) transformed.cache_control = part.cache_control;
+      return transformed;
     }
 
     // Handle functionCall: parse JSON strings in args
@@ -1313,6 +1322,7 @@ export function extractUsageMetadata(body: AntigravityApiBody): AntigravityUsage
     promptTokenCount: toNumber(asRecord.promptTokenCount),
     candidatesTokenCount: toNumber(asRecord.candidatesTokenCount),
     cachedContentTokenCount: toNumber(asRecord.cachedContentTokenCount),
+    thoughtsTokenCount: toNumber(asRecord.thoughtsTokenCount),
   };
 }
 
@@ -2185,6 +2195,11 @@ export function injectParameterSignatures(
     if (!Array.isArray(declarations)) return tool;
 
     const newDeclarations = declarations.map((decl: any) => {
+      // Skip if signature already injected (avoids duplicate injection)
+      if (decl.description?.includes("STRICT PARAMETERS:")) {
+        return decl;
+      }
+
       const schema = decl.parameters || decl.parametersJsonSchema;
       if (!schema) return decl;
 
@@ -2224,10 +2239,18 @@ export function injectToolHardeningInstruction(
 ): void {
   if (!instructionText) return;
 
+  // Skip if instruction already present (avoids duplicate injection)
+  const existing = payload.systemInstruction as Record<string, unknown> | undefined;
+  if (existing && typeof existing === "object" && "parts" in existing) {
+    const parts = existing.parts as Array<{ text?: string }>;
+    if (Array.isArray(parts) && parts.some(p => p.text?.includes("CRITICAL TOOL USAGE INSTRUCTIONS"))) {
+      return;
+    }
+  }
+
   const instructionPart = { text: instructionText };
 
   if (payload.systemInstruction) {
-    const existing = payload.systemInstruction as Record<string, unknown>;
     if (existing && typeof existing === "object" && "parts" in existing) {
       const parts = existing.parts as unknown[];
       if (Array.isArray(parts)) {
@@ -2250,5 +2273,148 @@ export function injectToolHardeningInstruction(
       parts: [instructionPart],
     };
   }
+}
+
+// ============================================================================
+// TOOL PROCESSING FOR WRAPPED REQUESTS
+// Shared logic for assigning tool IDs and fixing tool pairing
+// ============================================================================
+
+/**
+ * Assigns IDs to functionCall parts and returns the pending call IDs by name.
+ * This is the first pass of tool ID assignment.
+ * 
+ * @param contents - Gemini-style contents array
+ * @returns Object with modified contents and pending call IDs map
+ */
+export function assignToolIdsToContents(
+  contents: any[]
+): { contents: any[]; pendingCallIdsByName: Map<string, string[]>; toolCallCounter: number } {
+  if (!Array.isArray(contents)) {
+    return { contents, pendingCallIdsByName: new Map(), toolCallCounter: 0 };
+  }
+
+  let toolCallCounter = 0;
+  const pendingCallIdsByName = new Map<string, string[]>();
+
+  const newContents = contents.map((content: any) => {
+    if (!content || !Array.isArray(content.parts)) {
+      return content;
+    }
+
+    const newParts = content.parts.map((part: any) => {
+      if (part && typeof part === "object" && part.functionCall) {
+        const call = { ...part.functionCall };
+        if (!call.id) {
+          call.id = `tool-call-${++toolCallCounter}`;
+        }
+        const nameKey = typeof call.name === "string" ? call.name : `tool-${toolCallCounter}`;
+        const queue = pendingCallIdsByName.get(nameKey) || [];
+        queue.push(call.id);
+        pendingCallIdsByName.set(nameKey, queue);
+        return { ...part, functionCall: call };
+      }
+      return part;
+    });
+
+    return { ...content, parts: newParts };
+  });
+
+  return { contents: newContents, pendingCallIdsByName, toolCallCounter };
+}
+
+/**
+ * Matches functionResponse IDs to their corresponding functionCall IDs.
+ * This is the second pass of tool ID assignment.
+ * 
+ * @param contents - Gemini-style contents array
+ * @param pendingCallIdsByName - Map of function names to pending call IDs
+ * @returns Modified contents with matched response IDs
+ */
+export function matchResponseIdsToContents(
+  contents: any[],
+  pendingCallIdsByName: Map<string, string[]>
+): any[] {
+  if (!Array.isArray(contents)) {
+    return contents;
+  }
+
+  return contents.map((content: any) => {
+    if (!content || !Array.isArray(content.parts)) {
+      return content;
+    }
+
+    const newParts = content.parts.map((part: any) => {
+      if (part && typeof part === "object" && part.functionResponse) {
+        const resp = { ...part.functionResponse };
+        if (!resp.id && typeof resp.name === "string") {
+          const queue = pendingCallIdsByName.get(resp.name);
+          if (queue && queue.length > 0) {
+            resp.id = queue.shift();
+            pendingCallIdsByName.set(resp.name, queue);
+          }
+        }
+        return { ...part, functionResponse: resp };
+      }
+      return part;
+    });
+
+    return { ...content, parts: newParts };
+  });
+}
+
+/**
+ * Applies all tool fixes to a request payload for Claude models.
+ * This includes:
+ * 1. Tool ID assignment for functionCalls
+ * 2. Response ID matching for functionResponses
+ * 3. Orphan recovery via fixToolResponseGrouping
+ * 4. Claude format pairing fix via validateAndFixClaudeToolPairing
+ * 
+ * @param payload - Request payload object
+ * @param isClaude - Whether this is a Claude model request
+ * @returns Object with fix applied status
+ */
+export function applyToolPairingFixes(
+  payload: Record<string, unknown>,
+  isClaude: boolean
+): { contentsFixed: boolean; messagesFixed: boolean } {
+  let contentsFixed = false;
+  let messagesFixed = false;
+
+  if (!isClaude) {
+    return { contentsFixed, messagesFixed };
+  }
+
+  // Fix Gemini format (contents[])
+  if (Array.isArray(payload.contents)) {
+    // First pass: assign IDs to functionCalls
+    const { contents: contentsWithIds, pendingCallIdsByName } = assignToolIdsToContents(
+      payload.contents as any[]
+    );
+
+    // Second pass: match functionResponse IDs
+    const contentsWithMatchedIds = matchResponseIdsToContents(contentsWithIds, pendingCallIdsByName);
+
+    // Third pass: fix orphan recovery
+    payload.contents = fixToolResponseGrouping(contentsWithMatchedIds);
+    contentsFixed = true;
+
+    log.debug("Applied tool pairing fixes to contents[]", {
+      originalLength: (payload.contents as any[]).length,
+    });
+  }
+
+  // Fix Claude format (messages[])
+  if (Array.isArray(payload.messages)) {
+    payload.messages = validateAndFixClaudeToolPairing(payload.messages as any[]);
+    messagesFixed = true;
+
+    log.debug("Applied tool pairing fixes to messages[]", {
+      originalLength: (payload.messages as any[]).length,
+    });
+  }
+
+  return { contentsFixed, messagesFixed };
 }
 

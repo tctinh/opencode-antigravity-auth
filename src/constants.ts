@@ -134,3 +134,6 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
  */
 export const CLAUDE_DESCRIPTION_PROMPT = "\n\n⚠️ STRICT PARAMETERS: {params}.";
 
+export const EMPTY_SCHEMA_PLACEHOLDER_NAME = "_placeholder";
+export const EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION = "Placeholder. Always pass true.";
+

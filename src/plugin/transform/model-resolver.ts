@@ -72,9 +72,28 @@ const QUOTA_PREFIX_REGEX = /^antigravity-/i;
 const ANTIGRAVITY_ONLY_MODELS = /^(claude|gpt)/i;
 
 /**
+ * Models that support thinking tier suffixes.
+ * Only these models should have -low/-medium/-high stripped as thinking tiers.
+ * GPT models like gpt-oss-120b-medium should NOT have -medium stripped.
+ */
+function supportsThinkingTiers(model: string): boolean {
+  const lower = model.toLowerCase();
+  return (
+    lower.includes("gemini-3") ||
+    lower.includes("gemini-2.5") ||
+    (lower.includes("claude") && lower.includes("thinking"))
+  );
+}
+
+/**
  * Extracts thinking tier from model name suffix.
+ * Only extracts tier for models that support thinking tiers.
  */
 function extractThinkingTierFromModel(model: string): ThinkingTier | undefined {
+  // Only extract tier for models that support thinking tiers
+  if (!supportsThinkingTiers(model)) {
+    return undefined;
+  }
   const tierMatch = model.match(TIER_REGEX);
   return tierMatch?.[1] as ThinkingTier | undefined;
 }

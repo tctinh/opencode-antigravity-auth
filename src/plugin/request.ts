@@ -4,6 +4,8 @@ import {
   GEMINI_CLI_HEADERS,
   ANTIGRAVITY_ENDPOINT,
   GEMINI_CLI_ENDPOINT,
+  EMPTY_SCHEMA_PLACEHOLDER_NAME,
+  EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
   type HeaderStyle,
 } from "../constants";
 import { cacheSignature, getCachedSignature } from "./cache";
@@ -23,6 +25,7 @@ import {
   extractUsageMetadata,
   fixToolResponseGrouping,
   validateAndFixClaudeToolPairing,
+  applyToolPairingFixes,
   injectParameterSignatures,
   injectToolHardeningInstruction,
   isThinkingCapableModel,
@@ -737,6 +740,14 @@ function cacheThinkingSignatures(
  * Rewrites OpenAI-style requests into Antigravity shape, normalizing model, headers,
  * optional cached_content, and thinking config. Also toggles streaming mode for SSE actions.
  */
+/**
+ * Options for request preparation.
+ */
+export interface PrepareRequestOptions {
+  /** Enable Claude tool hardening (parameter signatures + system instruction). Default: true */
+  claudeToolHardening?: boolean;
+}
+
 export function prepareAntigravityRequest(
   input: RequestInfo,
   init: RequestInit | undefined,
@@ -745,6 +756,7 @@ export function prepareAntigravityRequest(
   endpointOverride?: string,
   headerStyle: HeaderStyle = "antigravity",
   forceThinkingRecovery = false,
+  options?: PrepareRequestOptions,
 ): {
   request: RequestInfo;
   init: RequestInit;
@@ -844,7 +856,10 @@ export function prepareAntigravityRequest(
         }
 
         const conversationKey = resolveConversationKeyFromRequests(requestObjects);
-        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, effectiveModel, conversationKey, resolveProjectKey(parsedBody.project));
+        // Strip tier suffix from model for cache key to prevent cache misses on tier change
+        // e.g., "claude-opus-4-5-thinking-high" -> "claude-opus-4-5-thinking"
+        const modelForCacheKey = effectiveModel.replace(/-(minimal|low|medium|high)$/i, "");
+        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, modelForCacheKey, conversationKey, resolveProjectKey(parsedBody.project));
 
         if (requestObjects.length > 0) {
           sessionId = signatureSessionKey;
@@ -866,6 +881,9 @@ export function prepareAntigravityRequest(
             if (isClaudeThinking && Array.isArray((req as any).messages)) {
               (req as any).messages = ensureThinkingBeforeToolUseInMessages((req as any).messages, signatureSessionKey);
             }
+
+            // Step 3: Apply tool pairing fixes (ID assignment, response matching, orphan recovery)
+            applyToolPairingFixes(req as Record<string, unknown>, true);
           }
         }
 
@@ -909,9 +927,14 @@ export function prepareAntigravityRequest(
         const hasAssistantHistory = Array.isArray(requestPayload.contents) &&
           requestPayload.contents.some((c: any) => c?.role === "model" || c?.role === "assistant");
 
+        // For claude-sonnet-4-5 (without -thinking suffix), ignore client's thinkingConfig
+        // Only claude-sonnet-4-5-thinking-* variants should have thinking enabled
+        const isClaudeSonnetNonThinking = effectiveModel.toLowerCase() === "claude-sonnet-4-5";
+        const effectiveUserThinkingConfig = isClaudeSonnetNonThinking ? undefined : userThinkingConfig;
+
         const finalThinkingConfig = resolveThinkingConfig(
-          userThinkingConfig,
-          resolved.isThinkingModel ?? isThinkingCapableModel(effectiveModel),
+          effectiveUserThinkingConfig,
+          isClaudeSonnetNonThinking ? false : (resolved.isThinkingModel ?? isThinkingCapableModel(effectiveModel)),
           isClaude,
           hasAssistantHistory,
         );
@@ -1061,12 +1084,12 @@ export function prepareAntigravityRequest(
                 ...base,
                 type: "object",
                 properties: {
-                  reason: {
-                    type: "string",
-                    description: "Brief explanation of why you are calling this tool",
+                  [EMPTY_SCHEMA_PLACEHOLDER_NAME]: {
+                    type: "boolean",
+                    description: EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
                   },
                 },
-                required: ["reason"],
+                required: [EMPTY_SCHEMA_PLACEHOLDER_NAME],
               });
 
               if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
@@ -1092,14 +1115,14 @@ export function prepareAntigravityRequest(
 
               if (!hasProperties) {
                 cleaned.properties = {
-                  reason: {
-                    type: "string",
-                    description: "Brief explanation of why you are calling this tool",
+                  [EMPTY_SCHEMA_PLACEHOLDER_NAME]: {
+                    type: "boolean",
+                    description: EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
                   },
                 };
                 cleaned.required = Array.isArray(cleaned.required)
-                  ? Array.from(new Set([...cleaned.required, "reason"]))
-                  : ["reason"];
+                  ? Array.from(new Set([...cleaned.required, EMPTY_SCHEMA_PLACEHOLDER_NAME]))
+                  : [EMPTY_SCHEMA_PLACEHOLDER_NAME];
               }
 
               return cleaned;
@@ -1109,15 +1132,19 @@ export function prepareAntigravityRequest(
               const pushDeclaration = (decl: any, source: string) => {
                 const schema =
                   decl?.parameters ||
+                  decl?.parametersJsonSchema ||
                   decl?.input_schema ||
                   decl?.inputSchema ||
                   tool.parameters ||
+                  tool.parametersJsonSchema ||
                   tool.input_schema ||
                   tool.inputSchema ||
                   tool.function?.parameters ||
+                  tool.function?.parametersJsonSchema ||
                   tool.function?.input_schema ||
                   tool.function?.inputSchema ||
                   tool.custom?.parameters ||
+                  tool.custom?.parametersJsonSchema ||
                   tool.custom?.input_schema;
 
                 let name =
@@ -1243,7 +1270,9 @@ export function prepareAntigravityRequest(
 
           // Apply Claude tool hardening (ported from LLM-API-Key-Proxy)
           // Injects parameter signatures into descriptions and adds system instruction
-          if (isClaude && Array.isArray(requestPayload.tools) && requestPayload.tools.length > 0) {
+          // Can be disabled via config.claude_tool_hardening = false to reduce context size
+          const enableToolHardening = options?.claudeToolHardening ?? true;
+          if (enableToolHardening && isClaude && Array.isArray(requestPayload.tools) && requestPayload.tools.length > 0) {
             // Inject parameter signatures into tool descriptions
             requestPayload.tools = injectParameterSignatures(
               requestPayload.tools,
@@ -1603,6 +1632,26 @@ export async function transformAntigravityResponse(
           (recoveryError as any).originalError = errorBody;
           (recoveryError as any).debugInfo = debugInfo;
           throw recoveryError;
+        }
+
+        // Detect context length / prompt too long errors - signal to caller for toast
+        const errorMessage = errorBody.error.message?.toLowerCase() || "";
+        if (
+          errorMessage.includes("prompt is too long") ||
+          errorMessage.includes("context length exceeded") ||
+          errorMessage.includes("context_length_exceeded") ||
+          errorMessage.includes("maximum context length")
+        ) {
+          headers.set("x-antigravity-context-error", "prompt_too_long");
+        }
+
+        // Detect tool pairing errors - signal to caller for toast
+        if (
+          errorMessage.includes("tool_use") &&
+          errorMessage.includes("tool_result") &&
+          (errorMessage.includes("without") || errorMessage.includes("immediately after"))
+        ) {
+          headers.set("x-antigravity-context-error", "tool_pairing");
         }
 
         return new Response(JSON.stringify(errorBody), {
